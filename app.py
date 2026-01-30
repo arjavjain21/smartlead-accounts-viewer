@@ -360,10 +360,17 @@ def main():
         st.markdown("---")
 
         # Search and Filter
-        col1, col2 = st.columns([2, 1])
+        col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
             search_text = st.text_input("🔍 Search across all columns", placeholder="Type to search...")
         with col2:
+            # Get unique clients for filter
+            if "client_lookup.name" in df.columns:
+                clients_list = ["All"] + sorted(df["client_lookup.name"].dropna().unique().tolist())
+                client_filter = st.selectbox("Filter by Client", clients_list, index=0)
+            else:
+                client_filter = "All"
+        with col3:
             status_filter = st.selectbox(
                 "Filter by Status",
                 ["All", "Active", "Inactive"],
@@ -377,6 +384,10 @@ def main():
         if search_text:
             mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_text, case=False, na=False)).any(axis=1)
             filtered_df = filtered_df[mask]
+
+        # Client filter
+        if client_filter != "All" and "client_lookup.name" in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df["client_lookup.name"] == client_filter]
 
         # Status filter
         if status_filter != "All" and "active_status" in filtered_df.columns:
