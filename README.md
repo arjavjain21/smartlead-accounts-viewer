@@ -61,8 +61,15 @@ Add your credentials:
 
 ```toml
 SMARTLEAD_BEARER_TOKEN = "your_actual_bearer_token_here"
+SMARTLEAD_API_KEY = "your_uuid_your_api_key"
 APP_PASSWORD = "changeMe"
 ```
+
+**Note:**
+- `SMARTLEAD_BEARER_TOKEN`: Used for fetching accounts (from your SmartLead dashboard)
+- `SMARTLEAD_API_KEY`: Used for fetching client names (format: `uuid_key`)
+  - Example: `2fbf4f7d-44af-4ff1-8e25-5655f5483fd0_94zyakr`
+  - This is optional but recommended for client name enrichment
 
 ### 5. Run Locally
 
@@ -94,6 +101,7 @@ git push -u origin main
 - Select `app.py` as main file
 - **IMPORTANT**: Add secrets in the deployment settings:
   - `SMARTLEAD_BEARER_TOKEN`: Your SmartLead API bearer token
+  - `SMARTLEAD_API_KEY`: Your SmartLead API key (optional, for client enrichment)
   - `APP_PASSWORD`: Your desired password (default: `changeMe`)
 
 3. **Access Your App**

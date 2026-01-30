@@ -11,8 +11,13 @@ nano .streamlit/secrets.toml
 Add your credentials:
 ```toml
 SMARTLEAD_BEARER_TOKEN = "paste_your_token_here"
+SMARTLEAD_API_KEY = "paste_your_api_key_here"
 APP_PASSWORD = "changeMe"
 ```
+
+**Where to find these:**
+- **Bearer Token**: SmartLead Dashboard → Settings → API
+- **API Key**: SmartLead Dashboard → Settings → API Key (format: uuid_key)
 
 ### 2. Run Setup Script
 ```bash
@@ -47,6 +52,7 @@ git push -u origin main
 4. Select `app.py`
 5. Add secrets in deployment settings:
    - `SMARTLEAD_BEARER_TOKEN`: Your token
+   - `SMARTLEAD_API_KEY`: Your API key (optional, for client names)
    - `APP_PASSWORD`: Your password
 
 ### 3. Access Your App

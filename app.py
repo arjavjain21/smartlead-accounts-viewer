@@ -145,17 +145,11 @@ def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> 
     return all_accounts
 
 
-def fetch_clients(bearer_token: str) -> Dict[int, Dict[str, Any]]:
+def fetch_clients(api_key: str) -> Dict[int, Dict[str, Any]]:
     """Retrieve clients and return a dict keyed by id."""
-    # Extract API key from bearer token or use separate endpoint
-    # For now, using the client URL with API key extracted from bearer
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {bearer_token}",
-    }
-
+    # Client endpoint requires API key as query parameter
     try:
-        resp = requests.get(CLIENT_URL, headers=headers, timeout=30)
+        resp = requests.get(f"{CLIENT_URL}?api_key={api_key}", timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, list):
@@ -268,7 +262,7 @@ def process_data(accounts: List[Dict[str, Any]], clients_by_id: Dict[int, Dict[s
     flat_rows = [clean_row(r) for r in flat_rows]
     df = pd.DataFrame(flat_rows)
 
-    # Reorder columns to put important ones first
+    # Reorder columns to put important ones first (only if they exist)
     priority_cols = [
         "id",
         "email",
@@ -278,8 +272,13 @@ def process_data(accounts: List[Dict[str, Any]], clients_by_id: Dict[int, Dict[s
         "status",
         "active_status",
     ]
+
+    # Only include columns that actually exist in the dataframe
+    existing_priority_cols = [col for col in priority_cols if col in df.columns]
     remaining_cols = [col for col in df.columns if col not in priority_cols]
-    df = df[priority_cols + remaining_cols]
+
+    if existing_priority_cols:
+        df = df[existing_priority_cols + remaining_cols]
 
     return df
 
@@ -318,6 +317,8 @@ def main():
         if st.button("🔄 Refresh Data from SmartLead", type="primary", use_container_width=True):
             with st.spinner("Fetching data from SmartLead API..."):
                 bearer_token = st.secrets.get("SMARTLEAD_BEARER_TOKEN", "")
+                api_key = st.secrets.get("SMARTLEAD_API_KEY", "")
+
                 if not bearer_token:
                     st.error("❌ SMARTLEAD_BEARER_TOKEN not found in secrets. Please configure it in .streamlit/secrets.toml")
                     return
@@ -327,7 +328,12 @@ def main():
                     st.warning("⚠️ No accounts found or API error occurred.")
                     return
 
-                clients_by_id = fetch_clients(bearer_token)
+                # Fetch clients if API key is provided
+                clients_by_id = {}
+                if api_key:
+                    clients_by_id = fetch_clients(api_key)
+                else:
+                    st.info("ℹ️ SMARTLEAD_API_KEY not provided. Client names will not be enriched.")
 
                 st.session_state.accounts_data = process_data(accounts, clients_by_id)
                 st.session_state.clients_data = clients_by_id
