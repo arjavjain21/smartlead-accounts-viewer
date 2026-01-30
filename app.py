@@ -67,15 +67,6 @@ st.markdown("""
 
 def check_password() -> bool:
     """Returns True if the user entered the correct password."""
-    def password_entered():
-        """Checks whether a password entered by the user is correct."""
-        if st.session_state.get("password") == st.secrets.get("APP_PASSWORD", "changeMe"):
-            st.session_state["password_correct"] = True
-            st.session_state["password"] = ""  # Clear password
-            st.rerun()
-        else:
-            st.session_state["password_correct"] = False
-
     # First time or after logout
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
@@ -83,14 +74,18 @@ def check_password() -> bool:
     if not st.session_state["password_correct"]:
         st.markdown("### 🔐 SmartLead Accounts Viewer")
         st.markdown("Please enter the password to access the application.")
-        st.text_input(
+        password_input = st.text_input(
             "Password",
             type="password",
-            on_change=password_entered,
             key="password"
         )
-        if not st.session_state["password_correct"]:
-            st.error("😕 Incorrect password. Please try again.")
+        if st.button("Login", use_container_width=True):
+            if password_input == st.secrets.get("APP_PASSWORD", "changeMe"):
+                st.session_state["password_correct"] = True
+                st.session_state["password"] = ""
+                st.rerun()
+            else:
+                st.error("😕 Incorrect password. Please try again.")
         return False
     return True
 
