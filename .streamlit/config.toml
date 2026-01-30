@@ -8,10 +8,3 @@ font = "sans serif"
 [client]
 showErrorDetails = false
 toolbarMode = "minimal"
-# Prevent auto-refresh on every interaction
-cachedKeyStaticPaths = []
-
-[runner]
-# Magic commands for better performance
-magicEnabled = true
-fastReruns = true

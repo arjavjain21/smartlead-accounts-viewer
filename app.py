@@ -82,7 +82,6 @@ def check_password() -> bool:
         if st.button("Login", use_container_width=True):
             if password_input == st.secrets.get("APP_PASSWORD", "changeMe"):
                 st.session_state["password_correct"] = True
-                st.session_state["password"] = ""
                 st.rerun()
             else:
                 st.error("😕 Incorrect password. Please try again.")
