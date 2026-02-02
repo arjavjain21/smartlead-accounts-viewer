@@ -371,11 +371,22 @@ def main():
             else:
                 client_filter = "All"
         with col3:
-            status_filter = st.selectbox(
-                "Filter by Status",
-                ["All", "Active", "Inactive"],
-                index=0
-            )
+            # Get unique vendor tags for multi-select filter
+            if "vendor_tag_names" in df.columns:
+                # Extract all vendor tags from semicolon-separated strings
+                all_vendor_tags = set()
+                for tags in df["vendor_tag_names"].dropna():
+                    if tags:
+                        all_vendor_tags.update(tags.split(";"))
+                vendor_tags_list = sorted(list(all_vendor_tags))
+                vendor_tags_filter = st.multiselect(
+                    "Filter by Vendor Tags",
+                    vendor_tags_list,
+                    default=[],
+                    placeholder="Select vendor tags..."
+                )
+            else:
+                vendor_tags_filter = []
 
         # Apply filters
         filtered_df = df.copy()
@@ -389,12 +400,13 @@ def main():
         if client_filter != "All" and "client_lookup.name" in filtered_df.columns:
             filtered_df = filtered_df[filtered_df["client_lookup.name"] == client_filter]
 
-        # Status filter
-        if status_filter != "All" and "active_status" in filtered_df.columns:
-            if status_filter == "Active":
-                filtered_df = filtered_df[filtered_df["active_status"] == True]
-            else:
-                filtered_df = filtered_df[filtered_df["active_status"] == False]
+        # Vendor tags filter - show accounts that have ANY of the selected vendor tags
+        if vendor_tags_filter and "vendor_tag_names" in filtered_df.columns:
+            # Create a mask for rows that contain any of the selected vendor tags
+            mask = filtered_df["vendor_tag_names"].apply(
+                lambda tags: any(tag in tags.split(";") if pd.notna(tags) and tags else False for tag in vendor_tags_filter)
+            )
+            filtered_df = filtered_df[mask]
 
         # Display filtered results count
         st.caption(f"📊 Showing {len(filtered_df)} of {len(df)} accounts")
