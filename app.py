@@ -3,7 +3,6 @@ SmartLead Accounts Viewer
 A production-ready Streamlit app to view, search, filter, and export SmartLead email accounts.
 """
 
-import io
 import json
 from datetime import datetime
 from typing import Any, Dict, List
@@ -277,6 +276,45 @@ def process_data(accounts: List[Dict[str, Any]], clients_by_id: Dict[int, Dict[s
     return df
 
 
+def build_client_vendor_summary(df: pd.DataFrame, selected_clients: List[str]) -> pd.DataFrame:
+    """Build summary grouped by client and vendor tag with unique email counts."""
+    required_cols = {"email", "client_lookup.name", "vendor_tag_names"}
+    if not required_cols.issubset(df.columns):
+        return pd.DataFrame()
+
+    summary_df = df[["email", "client_lookup.name", "vendor_tag_names"]].copy()
+    summary_df["client_lookup.name"] = summary_df["client_lookup.name"].fillna("Unknown Client")
+    summary_df["vendor_tag_names"] = summary_df["vendor_tag_names"].fillna("")
+
+    if selected_clients:
+        summary_df = summary_df[summary_df["client_lookup.name"].isin(selected_clients)]
+
+    summary_df["vendor_tag"] = summary_df["vendor_tag_names"].apply(
+        lambda tags: [tag.strip() for tag in tags.split(";") if tag.strip()] if tags else ["No Vendor Tag"]
+    )
+    summary_df = summary_df.explode("vendor_tag")
+
+    deduped = summary_df.drop_duplicates(subset=["client_lookup.name", "vendor_tag", "email"])
+    grouped = (
+        deduped
+        .groupby(["client_lookup.name", "vendor_tag"], dropna=False)["email"]
+        .nunique()
+        .reset_index(name="Unique Email Accounts")
+    )
+
+    client_totals = (
+        deduped
+        .groupby("client_lookup.name", dropna=False)["email"]
+        .nunique()
+        .reset_index(name="Client Total Unique Emails")
+    )
+
+    result = grouped.merge(client_totals, on="client_lookup.name", how="left")
+    result = result.rename(columns={"client_lookup.name": "Client", "vendor_tag": "Vendor Tag"})
+    result = result.sort_values(by=["Client", "Vendor Tag"]).reset_index(drop=True)
+    return result
+
+
 def main():
     """Main application."""
     if not check_password():
@@ -359,87 +397,127 @@ def main():
 
         st.markdown("---")
 
-        # Search and Filter
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            search_text = st.text_input("🔍 Search across all columns", placeholder="Type to search...")
-        with col2:
-            # Get unique clients for filter
+        accounts_tab, summary_tab = st.tabs(["📋 Accounts View", "📊 Client-Vendor Summary"])
+
+        with accounts_tab:
+            # Search and Filter
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                search_text = st.text_input("🔍 Search across all columns", placeholder="Type to search...")
+            with col2:
+                # Get unique clients for filter
+                if "client_lookup.name" in df.columns:
+                    clients_list = ["All"] + sorted(df["client_lookup.name"].dropna().unique().tolist())
+                    client_filter = st.selectbox("Filter by Client", clients_list, index=0)
+                else:
+                    client_filter = "All"
+            with col3:
+                # Get unique vendor tags for multi-select filter
+                if "vendor_tag_names" in df.columns:
+                    # Extract all vendor tags from semicolon-separated strings
+                    all_vendor_tags = set()
+                    for tags in df["vendor_tag_names"].dropna():
+                        if tags:
+                            all_vendor_tags.update(tags.split(";"))
+                    vendor_tags_list = sorted(list(all_vendor_tags))
+                    vendor_tags_filter = st.multiselect(
+                        "Filter by Vendor Tags",
+                        vendor_tags_list,
+                        default=[],
+                        placeholder="Select vendor tags..."
+                    )
+                else:
+                    vendor_tags_filter = []
+
+            # Apply filters
+            filtered_df = df.copy()
+
+            # Search filter
+            if search_text:
+                mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_text, case=False, na=False)).any(axis=1)
+                filtered_df = filtered_df[mask]
+
+            # Client filter
+            if client_filter != "All" and "client_lookup.name" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["client_lookup.name"] == client_filter]
+
+            # Vendor tags filter - show accounts that have ANY of the selected vendor tags
+            if vendor_tags_filter and "vendor_tag_names" in filtered_df.columns:
+                # Create a mask for rows that contain any of the selected vendor tags
+                mask = filtered_df["vendor_tag_names"].apply(
+                    lambda tags: any(tag in tags.split(";") if pd.notna(tags) and tags else False for tag in vendor_tags_filter)
+                )
+                filtered_df = filtered_df[mask]
+
+            # Display filtered results count
+            st.caption(f"📊 Showing {len(filtered_df)} of {len(df)} accounts")
+
+            # Display data
+            st.dataframe(
+                filtered_df,
+                use_container_width=True,
+                height=600,
+                column_config={
+                    "id": st.column_config.TextColumn("ID", width="small"),
+                    "email": st.column_config.TextColumn("Email", width="medium"),
+                    "client_lookup.name": st.column_config.TextColumn("Client", width="medium"),
+                    "vendor_tag_names": st.column_config.TextColumn("Vendor Tags", width="medium"),
+                    "normal_tag_names": st.column_config.TextColumn("Normal Tags", width="medium"),
+                    "status": st.column_config.TextColumn("Status", width="small"),
+                    "active_status": st.column_config.CheckboxColumn("Active", width="small"),
+                }
+            )
+
+            # CSV Export
+            st.markdown("---")
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                csv = filtered_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download CSV",
+                    data=csv,
+                    file_name=f"smartlead_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    type="primary"
+                )
+
+        with summary_tab:
+            st.markdown("### Client → Vendor Tag Breakdown")
+            st.caption("Independent summary view. Select one or multiple clients, including accounts without vendor tags.")
+
             if "client_lookup.name" in df.columns:
-                clients_list = ["All"] + sorted(df["client_lookup.name"].dropna().unique().tolist())
-                client_filter = st.selectbox("Filter by Client", clients_list, index=0)
-            else:
-                client_filter = "All"
-        with col3:
-            # Get unique vendor tags for multi-select filter
-            if "vendor_tag_names" in df.columns:
-                # Extract all vendor tags from semicolon-separated strings
-                all_vendor_tags = set()
-                for tags in df["vendor_tag_names"].dropna():
-                    if tags:
-                        all_vendor_tags.update(tags.split(";"))
-                vendor_tags_list = sorted(list(all_vendor_tags))
-                vendor_tags_filter = st.multiselect(
-                    "Filter by Vendor Tags",
-                    vendor_tags_list,
-                    default=[],
-                    placeholder="Select vendor tags..."
+                summary_clients = sorted(df["client_lookup.name"].fillna("Unknown Client").unique().tolist())
+                selected_clients = st.multiselect(
+                    "Select Clients",
+                    options=summary_clients,
+                    default=summary_clients,
+                    placeholder="Choose one or more clients"
                 )
             else:
-                vendor_tags_filter = []
+                selected_clients = []
 
-        # Apply filters
-        filtered_df = df.copy()
+            summary_df = build_client_vendor_summary(df, selected_clients)
 
-        # Search filter
-        if search_text:
-            mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_text, case=False, na=False)).any(axis=1)
-            filtered_df = filtered_df[mask]
+            if summary_df.empty:
+                st.info("No summary data available. Please select clients and ensure vendor/client/email columns exist.")
+            else:
+                total_unique_emails = summary_df[["Client", "Client Total Unique Emails"]].drop_duplicates()[
+                    "Client Total Unique Emails"
+                ].sum()
+                st.metric("Grand Total Unique Emails (across selected clients)", int(total_unique_emails))
 
-        # Client filter
-        if client_filter != "All" and "client_lookup.name" in filtered_df.columns:
-            filtered_df = filtered_df[filtered_df["client_lookup.name"] == client_filter]
+                st.dataframe(summary_df, use_container_width=True, height=600)
 
-        # Vendor tags filter - show accounts that have ANY of the selected vendor tags
-        if vendor_tags_filter and "vendor_tag_names" in filtered_df.columns:
-            # Create a mask for rows that contain any of the selected vendor tags
-            mask = filtered_df["vendor_tag_names"].apply(
-                lambda tags: any(tag in tags.split(";") if pd.notna(tags) and tags else False for tag in vendor_tags_filter)
-            )
-            filtered_df = filtered_df[mask]
-
-        # Display filtered results count
-        st.caption(f"📊 Showing {len(filtered_df)} of {len(df)} accounts")
-
-        # Display data
-        st.dataframe(
-            filtered_df,
-            use_container_width=True,
-            height=600,
-            column_config={
-                "id": st.column_config.TextColumn("ID", width="small"),
-                "email": st.column_config.TextColumn("Email", width="medium"),
-                "client_lookup.name": st.column_config.TextColumn("Client", width="medium"),
-                "vendor_tag_names": st.column_config.TextColumn("Vendor Tags", width="medium"),
-                "normal_tag_names": st.column_config.TextColumn("Normal Tags", width="medium"),
-                "status": st.column_config.TextColumn("Status", width="small"),
-                "active_status": st.column_config.CheckboxColumn("Active", width="small"),
-            }
-        )
-
-        # CSV Export
-        st.markdown("---")
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            csv = filtered_df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv,
-                file_name=f"smartlead_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                type="primary"
-            )
+                summary_csv = summary_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Summary CSV",
+                    data=summary_csv,
+                    file_name=f"smartlead_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    type="primary"
+                )
 
     else:
         st.markdown('<div class="warning-box">👆 Click the "Refresh Data" button above to fetch accounts from SmartLead API.</div>', unsafe_allow_html=True)
