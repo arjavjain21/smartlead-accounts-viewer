@@ -255,6 +255,22 @@ def process_data(accounts: List[Dict[str, Any]], clients_by_id: Dict[int, Dict[s
     flat_rows = [clean_row(r) for r in flat_rows]
     df = pd.DataFrame(flat_rows)
 
+    # Normalize key analytical columns based on API variants
+    if "client_lookup.name" not in df.columns:
+        if "client" in df.columns:
+            df["client_lookup.name"] = df["client"]
+        else:
+            df["client_lookup.name"] = "Unknown Client"
+
+    if "vendor_tag_names" not in df.columns:
+        if "vendor_tags" in df.columns:
+            df["vendor_tag_names"] = df["vendor_tags"]
+        else:
+            df["vendor_tag_names"] = ""
+
+    if "email" not in df.columns and "from_email" in df.columns:
+        df["email"] = df["from_email"]
+
     # Reorder columns to put important ones first (only if they exist)
     priority_cols = [
         "id",
@@ -278,13 +294,22 @@ def process_data(accounts: List[Dict[str, Any]], clients_by_id: Dict[int, Dict[s
 
 def build_client_vendor_summary(df: pd.DataFrame, selected_clients: List[str]) -> pd.DataFrame:
     """Build summary grouped by client and vendor tag with unique email counts."""
-    required_cols = {"email", "client_lookup.name", "vendor_tag_names"}
-    if not required_cols.issubset(df.columns):
+    email_col = "email" if "email" in df.columns else "from_email" if "from_email" in df.columns else None
+    client_col = "client_lookup.name" if "client_lookup.name" in df.columns else "client" if "client" in df.columns else None
+    vendor_col = "vendor_tag_names" if "vendor_tag_names" in df.columns else "vendor_tags" if "vendor_tags" in df.columns else None
+
+    if not email_col or not client_col:
         return pd.DataFrame()
 
-    summary_df = df[["email", "client_lookup.name", "vendor_tag_names"]].copy()
+    summary_df = df[[email_col, client_col]].copy()
+    summary_df = summary_df.rename(columns={email_col: "email", client_col: "client_lookup.name"})
+    summary_df["vendor_tag_names"] = df[vendor_col] if vendor_col else ""
+
     summary_df["client_lookup.name"] = summary_df["client_lookup.name"].fillna("Unknown Client")
+    summary_df["client_lookup.name"] = summary_df["client_lookup.name"].replace("", "Unknown Client")
     summary_df["vendor_tag_names"] = summary_df["vendor_tag_names"].fillna("")
+    summary_df["email"] = summary_df["email"].fillna("")
+    summary_df = summary_df[summary_df["email"].astype(str).str.strip() != ""]
 
     if selected_clients:
         summary_df = summary_df[summary_df["client_lookup.name"].isin(selected_clients)]
@@ -293,6 +318,7 @@ def build_client_vendor_summary(df: pd.DataFrame, selected_clients: List[str]) -
         lambda tags: [tag.strip() for tag in tags.split(";") if tag.strip()] if tags else ["No Vendor Tag"]
     )
     summary_df = summary_df.explode("vendor_tag")
+    summary_df["vendor_tag"] = summary_df["vendor_tag"].fillna("No Vendor Tag")
 
     deduped = summary_df.drop_duplicates(subset=["client_lookup.name", "vendor_tag", "email"])
     grouped = (
@@ -486,8 +512,9 @@ def main():
             st.markdown("### Client → Vendor Tag Breakdown")
             st.caption("Independent summary view. Select one or multiple clients, including accounts without vendor tags.")
 
-            if "client_lookup.name" in df.columns:
-                summary_clients = sorted(df["client_lookup.name"].fillna("Unknown Client").unique().tolist())
+            summary_client_col = "client_lookup.name" if "client_lookup.name" in df.columns else "client" if "client" in df.columns else None
+            if summary_client_col:
+                summary_clients = sorted(df[summary_client_col].fillna("Unknown Client").replace("", "Unknown Client").unique().tolist())
                 selected_clients = st.multiselect(
                     "Select Clients",
                     options=summary_clients,
