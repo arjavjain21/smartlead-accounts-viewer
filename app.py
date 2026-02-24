@@ -278,36 +278,19 @@ def process_data(accounts: List[Dict[str, Any]], clients_by_id: Dict[int, Dict[s
 
 def build_client_vendor_summary(df: pd.DataFrame, selected_clients: List[str]) -> pd.DataFrame:
     """Build summary grouped by client and vendor tag with unique email counts."""
-    if "client_lookup.name" not in df.columns:
+    required_cols = {"email", "client_lookup.name", "vendor_tag_names"}
+    if not required_cols.issubset(df.columns):
         return pd.DataFrame()
 
-    # Be resilient to schema differences: vendor tags or email may not always be present.
-    vendor_col = "vendor_tag_names" if "vendor_tag_names" in df.columns else None
-    email_col_candidates = ["email", "from_email", "sender_email", "id"]
-    email_col = next((col for col in email_col_candidates if col in df.columns), None)
-
-    if email_col is None:
-        return pd.DataFrame()
-
-    summary_df = df[[email_col, "client_lookup.name"]].copy()
-    summary_df = summary_df.rename(columns={email_col: "email"})
-
-    if vendor_col:
-        summary_df["vendor_tag_names"] = df[vendor_col]
-    else:
-        summary_df["vendor_tag_names"] = ""
-
+    summary_df = df[["email", "client_lookup.name", "vendor_tag_names"]].copy()
     summary_df["client_lookup.name"] = summary_df["client_lookup.name"].fillna("Unknown Client")
     summary_df["vendor_tag_names"] = summary_df["vendor_tag_names"].fillna("")
 
     if selected_clients:
         summary_df = summary_df[summary_df["client_lookup.name"].isin(selected_clients)]
 
-    if summary_df.empty:
-        return pd.DataFrame()
-
     summary_df["vendor_tag"] = summary_df["vendor_tag_names"].apply(
-        lambda tags: [tag.strip() for tag in str(tags).split(";") if tag.strip()] if str(tags).strip() else ["No Vendor Tag"]
+        lambda tags: [tag.strip() for tag in tags.split(";") if tag.strip()] if tags else ["No Vendor Tag"]
     )
     summary_df = summary_df.explode("vendor_tag")
 
@@ -517,7 +500,7 @@ def main():
             summary_df = build_client_vendor_summary(df, selected_clients)
 
             if summary_df.empty:
-                st.info("No summary data available for the selected clients.")
+                st.info("No summary data available. Please select clients and ensure vendor/client/email columns exist.")
             else:
                 total_unique_emails = summary_df[["Client", "Client Total Unique Emails"]].drop_duplicates()[
                     "Client Total Unique Emails"
