@@ -4,6 +4,7 @@ A production-ready Streamlit app to view, search, filter, and export SmartLead e
 """
 
 import json
+import time
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -14,7 +15,12 @@ import pandas as pd
 # Configuration
 ACCOUNTS_URL = "https://server.smartlead.ai/api/email-account/get-total-email-accounts"
 CLIENT_URL = "https://server.smartlead.ai/api/v1/client/"
-ACCOUNTS_LIMIT = 10000
+ACCOUNTS_LIMIT = 100
+INITIAL_PAGE_DELAY_SECONDS = 0.5
+PAGE_PAUSE_SECONDS = 0.5
+MAX_RETRIES = 5
+RETRY_BACKOFF_SECONDS = 30
+RATE_LIMIT_COOLDOWN_SECONDS = 60
 
 # Page config
 st.set_page_config(
@@ -88,27 +94,57 @@ def check_password() -> bool:
     return True
 
 
-def fetch_account_page(offset: int, limit: int, bearer_token: str) -> List[Dict[str, Any]]:
-    """Fetch a single page of accounts."""
+def fetch_account_page(offset: int, limit: int, bearer_token: str, max_retries: int = MAX_RETRIES) -> List[Dict[str, Any]]:
+    """Fetch a single page of accounts with retry and backoff for rate limits."""
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {bearer_token}",
     }
 
-    try:
-        resp = requests.get(
-            ACCOUNTS_URL,
-            headers=headers,
-            params={"offset": offset, "limit": limit},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        accounts = payload.get("data", {}).get("email_accounts")
-        return accounts if isinstance(accounts, list) else []
-    except requests.RequestException as e:
-        st.error(f"❌ Failed to fetch accounts: {str(e)}")
-        return []
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(
+                ACCOUNTS_URL,
+                headers=headers,
+                params={"offset": offset, "limit": limit},
+                timeout=30,
+            )
+
+            if resp.status_code == 429:
+                st.warning(
+                    f"⚠️ Rate limit hit at offset {offset}. Cooling down for {RATE_LIMIT_COOLDOWN_SECONDS}s "
+                    f"(attempt {attempt}/{max_retries})."
+                )
+                time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+                continue
+
+            resp.raise_for_status()
+            payload = resp.json()
+            if isinstance(payload, dict):
+                message = str(payload.get("message", "")).lower()
+                if "too many attempts" in message or "rate limit" in message:
+                    st.warning(
+                        f"⚠️ API reported rate limit at offset {offset}. Cooling down for {RATE_LIMIT_COOLDOWN_SECONDS}s "
+                        f"(attempt {attempt}/{max_retries})."
+                    )
+                    time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+                    continue
+
+            accounts = payload.get("data", {}).get("email_accounts") if isinstance(payload, dict) else None
+            return accounts if isinstance(accounts, list) else []
+        except requests.RequestException as e:
+            if attempt == max_retries:
+                st.error(f"❌ Failed to fetch accounts at offset {offset} after {max_retries} attempts: {str(e)}")
+                return []
+
+            st.warning(
+                f"⚠️ Request failed at offset {offset}. Retrying in {RETRY_BACKOFF_SECONDS}s "
+                f"(attempt {attempt}/{max_retries}). Error: {str(e)}"
+            )
+            time.sleep(RETRY_BACKOFF_SECONDS)
+
+    st.error(f"❌ Failed to fetch accounts at offset {offset} due to repeated rate limiting.")
+    return []
 
 
 def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> List[Dict[str, Any]]:
@@ -117,6 +153,7 @@ def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> 
     offset = 0
     progress_bar = st.progress(0)
     status_text = st.empty()
+    time.sleep(INITIAL_PAGE_DELAY_SECONDS)
 
     while True:
         status_text.text(f"Fetching accounts... (offset: {offset})")
@@ -132,6 +169,7 @@ def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> 
             break
 
         offset += limit
+        time.sleep(PAGE_PAUSE_SECONDS)
 
     progress_bar.empty()
     status_text.empty()
@@ -341,6 +379,67 @@ def build_client_vendor_summary(df: pd.DataFrame, selected_clients: List[str]) -
     return result
 
 
+def normalize_email(value: Any) -> str:
+    """Normalize email strings for case-insensitive matching."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip().lower()
+
+
+def build_email_lookup(source_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a deduplicated source dataframe keyed by normalized email."""
+    if "email" not in source_df.columns:
+        return pd.DataFrame()
+
+    lookup = source_df.copy()
+    lookup["__normalized_email"] = lookup["email"].apply(normalize_email)
+    lookup = lookup[lookup["__normalized_email"] != ""]
+    lookup = lookup.drop_duplicates(subset=["__normalized_email"], keep="first")
+    return lookup
+
+
+def enrich_uploaded_df(
+    upload_df: pd.DataFrame,
+    email_col: str,
+    source_df: pd.DataFrame,
+    selected_cols: List[str]
+) -> pd.DataFrame:
+    """Enrich uploaded rows from source dataframe by matching email."""
+    if email_col not in upload_df.columns:
+        raise ValueError(f"Selected email column '{email_col}' is not present in uploaded file.")
+
+    source_lookup = build_email_lookup(source_df)
+    result_df = upload_df.copy()
+    result_df["__normalized_email"] = result_df[email_col].apply(normalize_email)
+
+    invalid_mask = result_df["__normalized_email"] == ""
+    result_df["enrich_status"] = "email_not_found"
+    result_df.loc[invalid_mask, "enrich_status"] = "invalid_email"
+    result_df["matched_email"] = ""
+
+    if source_lookup.empty:
+        for col in selected_cols:
+            result_df[col] = ""
+        return result_df.drop(columns=["__normalized_email"])
+
+    source_cols = ["__normalized_email", "email"] + [c for c in selected_cols if c in source_lookup.columns]
+    merge_source = source_lookup[source_cols].copy()
+    merged = result_df.merge(merge_source, on="__normalized_email", how="left", suffixes=("", "__src"))
+
+    merged["matched_email"] = merged["email"].fillna("")
+    found_mask = (merged["matched_email"] != "") & (~invalid_mask)
+    merged.loc[found_mask, "enrich_status"] = "found"
+
+    for col in selected_cols:
+        if col in merge_source.columns:
+            merged[col] = merged[col]
+        else:
+            merged[col] = ""
+
+    cols_to_drop = [c for c in ["email", "__normalized_email"] if c in merged.columns]
+    return merged.drop(columns=cols_to_drop)
+
+
 def main():
     """Main application."""
     if not check_password():
@@ -423,7 +522,9 @@ def main():
 
         st.markdown("---")
 
-        accounts_tab, summary_tab = st.tabs(["📋 Accounts View", "📊 Client-Vendor Summary"])
+        accounts_tab, summary_tab, upload_tab = st.tabs(
+            ["📋 Accounts View", "📊 Client-Vendor Summary", "📤 Upload & Enrich"]
+        )
 
         with accounts_tab:
             # Search and Filter
@@ -545,6 +646,74 @@ def main():
                     use_container_width=True,
                     type="primary"
                 )
+
+        with upload_tab:
+            st.markdown("### Upload & Enrich Email List")
+            st.caption("Upload a CSV, select an email column, and append SmartLead columns by email match.")
+
+            uploaded_file = st.file_uploader("Upload CSV file", type=["csv"], key="upload_enrich_csv")
+            if uploaded_file is None:
+                st.info("Upload a CSV file to begin enrichment.")
+            else:
+                try:
+                    upload_df = pd.read_csv(uploaded_file)
+                except Exception as e:
+                    st.error(f"Unable to read CSV file: {str(e)}")
+                    upload_df = pd.DataFrame()
+
+                if upload_df.empty:
+                    st.warning("Uploaded file is empty or could not be parsed into rows.")
+                else:
+                    st.write("Preview of uploaded data:")
+                    st.dataframe(upload_df.head(20), use_container_width=True)
+
+                    email_options = upload_df.columns.tolist()
+                    default_idx = email_options.index("email") if "email" in email_options else 0
+                    selected_email_col = st.selectbox(
+                        "Select the email column from your file",
+                        options=email_options,
+                        index=default_idx
+                    )
+
+                    available_enrich_cols = [c for c in df.columns if c != "email"]
+                    default_enrich_cols = [c for c in ["client_lookup.name", "status", "active_status"] if c in available_enrich_cols]
+                    selected_enrich_cols = st.multiselect(
+                        "Select columns to append from SmartLead data",
+                        options=available_enrich_cols,
+                        default=default_enrich_cols
+                    )
+
+                    if st.button("✨ Enrich Uploaded File", type="primary", use_container_width=True):
+                        enriched_df = enrich_uploaded_df(
+                            upload_df=upload_df,
+                            email_col=selected_email_col,
+                            source_df=df,
+                            selected_cols=selected_enrich_cols
+                        )
+
+                        total_rows = len(enriched_df)
+                        found_rows = int((enriched_df["enrich_status"] == "found").sum())
+                        not_found_rows = int((enriched_df["enrich_status"] == "email_not_found").sum())
+                        invalid_rows = int((enriched_df["enrich_status"] == "invalid_email").sum())
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Total Rows", total_rows)
+                        m2.metric("Found", found_rows)
+                        m3.metric("Not Found", not_found_rows)
+                        m4.metric("Invalid Email", invalid_rows)
+
+                        st.write("Enriched result preview:")
+                        st.dataframe(enriched_df.head(100), use_container_width=True, height=400)
+
+                        enrich_csv = enriched_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Enriched CSV",
+                            data=enrich_csv,
+                            file_name=f"smartlead_enriched_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            type="primary"
+                        )
 
     else:
         st.markdown('<div class="warning-box">👆 Click the "Refresh Data" button above to fetch accounts from SmartLead API.</div>', unsafe_allow_html=True)
