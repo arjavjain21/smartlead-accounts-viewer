@@ -4,6 +4,7 @@ A production-ready Streamlit app to view, search, filter, and export SmartLead e
 """
 
 import json
+import time
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -15,6 +16,11 @@ import pandas as pd
 ACCOUNTS_URL = "https://server.smartlead.ai/api/email-account/get-total-email-accounts"
 CLIENT_URL = "https://server.smartlead.ai/api/v1/client/"
 ACCOUNTS_LIMIT = 100
+INITIAL_PAGE_DELAY_SECONDS = 0.5
+PAGE_PAUSE_SECONDS = 0.5
+MAX_RETRIES = 5
+RETRY_BACKOFF_SECONDS = 30
+RATE_LIMIT_COOLDOWN_SECONDS = 60
 
 # Page config
 st.set_page_config(
@@ -88,27 +94,57 @@ def check_password() -> bool:
     return True
 
 
-def fetch_account_page(offset: int, limit: int, bearer_token: str) -> List[Dict[str, Any]]:
-    """Fetch a single page of accounts."""
+def fetch_account_page(offset: int, limit: int, bearer_token: str, max_retries: int = MAX_RETRIES) -> List[Dict[str, Any]]:
+    """Fetch a single page of accounts with retry and backoff for rate limits."""
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {bearer_token}",
     }
 
-    try:
-        resp = requests.get(
-            ACCOUNTS_URL,
-            headers=headers,
-            params={"offset": offset, "limit": limit},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        accounts = payload.get("data", {}).get("email_accounts")
-        return accounts if isinstance(accounts, list) else []
-    except requests.RequestException as e:
-        st.error(f"❌ Failed to fetch accounts: {str(e)}")
-        return []
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(
+                ACCOUNTS_URL,
+                headers=headers,
+                params={"offset": offset, "limit": limit},
+                timeout=30,
+            )
+
+            if resp.status_code == 429:
+                st.warning(
+                    f"⚠️ Rate limit hit at offset {offset}. Cooling down for {RATE_LIMIT_COOLDOWN_SECONDS}s "
+                    f"(attempt {attempt}/{max_retries})."
+                )
+                time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+                continue
+
+            resp.raise_for_status()
+            payload = resp.json()
+            if isinstance(payload, dict):
+                message = str(payload.get("message", "")).lower()
+                if "too many attempts" in message or "rate limit" in message:
+                    st.warning(
+                        f"⚠️ API reported rate limit at offset {offset}. Cooling down for {RATE_LIMIT_COOLDOWN_SECONDS}s "
+                        f"(attempt {attempt}/{max_retries})."
+                    )
+                    time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+                    continue
+
+            accounts = payload.get("data", {}).get("email_accounts") if isinstance(payload, dict) else None
+            return accounts if isinstance(accounts, list) else []
+        except requests.RequestException as e:
+            if attempt == max_retries:
+                st.error(f"❌ Failed to fetch accounts at offset {offset} after {max_retries} attempts: {str(e)}")
+                return []
+
+            st.warning(
+                f"⚠️ Request failed at offset {offset}. Retrying in {RETRY_BACKOFF_SECONDS}s "
+                f"(attempt {attempt}/{max_retries}). Error: {str(e)}"
+            )
+            time.sleep(RETRY_BACKOFF_SECONDS)
+
+    st.error(f"❌ Failed to fetch accounts at offset {offset} due to repeated rate limiting.")
+    return []
 
 
 def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> List[Dict[str, Any]]:
@@ -117,6 +153,7 @@ def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> 
     offset = 0
     progress_bar = st.progress(0)
     status_text = st.empty()
+    time.sleep(INITIAL_PAGE_DELAY_SECONDS)
 
     while True:
         status_text.text(f"Fetching accounts... (offset: {offset})")
@@ -132,6 +169,7 @@ def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> 
             break
 
         offset += limit
+        time.sleep(PAGE_PAUSE_SECONDS)
 
     progress_bar.empty()
     status_text.empty()
