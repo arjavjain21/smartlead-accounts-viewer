@@ -14,7 +14,7 @@ import pandas as pd
 # Configuration
 ACCOUNTS_URL = "https://server.smartlead.ai/api/email-account/get-total-email-accounts"
 CLIENT_URL = "https://server.smartlead.ai/api/v1/client/"
-ACCOUNTS_LIMIT = 10000
+ACCOUNTS_LIMIT = 100
 
 # Page config
 st.set_page_config(
