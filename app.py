@@ -6,7 +6,8 @@ A production-ready Streamlit app to view, search, filter, and export SmartLead e
 import json
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Optional
 
 import requests
 import streamlit as st
@@ -15,11 +16,11 @@ import pandas as pd
 # Configuration
 ACCOUNTS_URL = "https://server.smartlead.ai/api/email-account/get-total-email-accounts"
 CLIENT_URL = "https://server.smartlead.ai/api/v1/client/"
-ACCOUNTS_LIMIT = 100
-INITIAL_PAGE_DELAY_SECONDS = 0.5
-PAGE_PAUSE_SECONDS = 0.5
-MAX_RETRIES = 5
-RETRY_BACKOFF_SECONDS = 30
+ACCOUNTS_PAGE_LIMIT = 100
+SMARTLEAD_REQUESTS_PER_MINUTE = 800
+MIN_ACCOUNT_REQUEST_INTERVAL_SECONDS = 60 / SMARTLEAD_REQUESTS_PER_MINUTE
+MAX_RETRIES = 6
+RETRY_BACKOFF_SECONDS = 5
 RATE_LIMIT_COOLDOWN_SECONDS = 60
 
 # Page config
@@ -94,8 +95,50 @@ def check_password() -> bool:
     return True
 
 
-def fetch_account_page(offset: int, limit: int, bearer_token: str, max_retries: int = MAX_RETRIES) -> List[Dict[str, Any]]:
-    """Fetch a single page of accounts with retry and backoff for rate limits."""
+class AccountFetchError(RuntimeError):
+    """Raised when a page cannot be fetched safely after retries."""
+
+
+def get_retry_after_seconds(retry_after: Optional[str]) -> Optional[float]:
+    """Parse an HTTP Retry-After header as seconds when present."""
+    if not retry_after:
+        return None
+
+    retry_after = retry_after.strip()
+    if retry_after.isdigit():
+        return float(retry_after)
+
+    try:
+        retry_at = parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError):
+        return None
+
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.astimezone()
+
+    return max((retry_at - datetime.now(retry_at.tzinfo)).total_seconds(), 0.0)
+
+
+def rate_limit_wait(last_request_at: Optional[float]) -> float:
+    """Wait just enough to keep account-page requests within the configured RPM."""
+    if last_request_at is None:
+        return time.monotonic()
+
+    elapsed = time.monotonic() - last_request_at
+    remaining = MIN_ACCOUNT_REQUEST_INTERVAL_SECONDS - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+
+    return time.monotonic()
+
+
+def fetch_account_page(
+    offset: int,
+    limit: int,
+    bearer_token: str,
+    max_retries: int = MAX_RETRIES
+) -> List[Dict[str, Any]]:
+    """Fetch a single account page with retries; raise instead of returning partial failure."""
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {bearer_token}",
@@ -111,11 +154,12 @@ def fetch_account_page(offset: int, limit: int, bearer_token: str, max_retries: 
             )
 
             if resp.status_code == 429:
+                retry_delay = get_retry_after_seconds(resp.headers.get("Retry-After")) or RATE_LIMIT_COOLDOWN_SECONDS
                 st.warning(
-                    f"⚠️ Rate limit hit at offset {offset}. Cooling down for {RATE_LIMIT_COOLDOWN_SECONDS}s "
+                    f"⚠️ Rate limit hit at offset {offset}. Cooling down for {retry_delay:.0f}s "
                     f"(attempt {attempt}/{max_retries})."
                 )
-                time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+                time.sleep(retry_delay)
                 continue
 
             resp.raise_for_status()
@@ -130,51 +174,64 @@ def fetch_account_page(offset: int, limit: int, bearer_token: str, max_retries: 
                     time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
                     continue
 
-            accounts = payload.get("data", {}).get("email_accounts") if isinstance(payload, dict) else None
-            return accounts if isinstance(accounts, list) else []
+            data = payload.get("data") if isinstance(payload, dict) else None
+            accounts = data.get("email_accounts") if isinstance(data, dict) else None
+            if not isinstance(accounts, list):
+                raise AccountFetchError(f"Unexpected account response format at offset {offset}.")
+
+            return accounts
         except requests.RequestException as e:
             if attempt == max_retries:
-                st.error(f"❌ Failed to fetch accounts at offset {offset} after {max_retries} attempts: {str(e)}")
-                return []
+                raise AccountFetchError(
+                    f"Failed to fetch accounts at offset {offset} after {max_retries} attempts: {str(e)}"
+                ) from e
 
+            retry_delay = RETRY_BACKOFF_SECONDS * attempt
             st.warning(
-                f"⚠️ Request failed at offset {offset}. Retrying in {RETRY_BACKOFF_SECONDS}s "
+                f"⚠️ Request failed at offset {offset}. Retrying in {retry_delay}s "
                 f"(attempt {attempt}/{max_retries}). Error: {str(e)}"
             )
-            time.sleep(RETRY_BACKOFF_SECONDS)
+            time.sleep(retry_delay)
 
-    st.error(f"❌ Failed to fetch accounts at offset {offset} due to repeated rate limiting.")
-    return []
+    raise AccountFetchError(f"Failed to fetch accounts at offset {offset} due to repeated rate limiting.")
 
 
-def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_LIMIT) -> List[Dict[str, Any]]:
-    """Retrieve all email accounts by paginating until no rows are returned."""
+def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_PAGE_LIMIT) -> List[Dict[str, Any]]:
+    """Retrieve every email account page using limit=100 and an 800 RPM throttle."""
+    if limit != ACCOUNTS_PAGE_LIMIT:
+        raise ValueError(f"SmartLead account fetches must use limit={ACCOUNTS_PAGE_LIMIT} to keep pagination stable.")
+
     all_accounts: List[Dict[str, Any]] = []
     offset = 0
+    page_number = 1
+    last_request_at: Optional[float] = None
     progress_bar = st.progress(0)
     status_text = st.empty()
-    time.sleep(INITIAL_PAGE_DELAY_SECONDS)
 
     while True:
-        status_text.text(f"Fetching accounts... (offset: {offset})")
-        page = fetch_account_page(offset, limit, bearer_token)
+        status_text.text(
+            f"Fetching SmartLead accounts page {page_number} "
+            f"(offset {offset}, limit {ACCOUNTS_PAGE_LIMIT}, cap {SMARTLEAD_REQUESTS_PER_MINUTE} requests/min)..."
+        )
+        last_request_at = rate_limit_wait(last_request_at)
+        page = fetch_account_page(offset, ACCOUNTS_PAGE_LIMIT, bearer_token)
 
         if not page:
             break
 
         all_accounts.extend(page)
         progress_bar.progress(min(len(all_accounts) / 10000, 1.0))
+        status_text.text(f"Fetched {len(all_accounts)} accounts so far; last page returned {len(page)} rows.")
 
-        if len(page) < limit:
+        if len(page) < ACCOUNTS_PAGE_LIMIT:
             break
 
-        offset += limit
-        time.sleep(PAGE_PAUSE_SECONDS)
+        offset += ACCOUNTS_PAGE_LIMIT
+        page_number += 1
 
     progress_bar.empty()
     status_text.empty()
     return all_accounts
-
 
 def fetch_clients(api_key: str) -> Dict[int, Dict[str, Any]]:
     """Retrieve clients and return a dict keyed by id."""
@@ -480,7 +537,13 @@ def main():
                     st.error("❌ SMARTLEAD_BEARER_TOKEN not found in secrets. Please configure it in .streamlit/secrets.toml")
                     return
 
-                accounts = fetch_accounts_paginated(bearer_token)
+                try:
+                    accounts = fetch_accounts_paginated(bearer_token)
+                except AccountFetchError as e:
+                    st.error(f"❌ {str(e)}")
+                    st.info("No partial data was saved. Please retry after the API recovers so the full account set is fetched.")
+                    return
+
                 if not accounts:
                     st.warning("⚠️ No accounts found or API error occurred.")
                     return

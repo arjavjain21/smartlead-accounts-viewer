@@ -6,6 +6,7 @@ A production-ready Streamlit application to view, search, filter, and export Sma
 
 - 🔐 **Password Protected**: Secure access with configurable password
 - 🔄 **Manual Refresh**: Fetch latest data on-demand from SmartLead API
+- 🚀 **Optimized Pagination**: Fetch all account pages with `limit=100` and an 800 requests/minute throttle
 - 🔍 **Interactive Search**: Real-time search across all columns
 - 🎯 **Smart Filtering**: Filter by account status (Active/Inactive)
 - 📊 **Rich Metrics**: Dashboard with key account statistics
@@ -191,8 +192,8 @@ sudo certbot --nginx -d smartlead-accounts.eagleinfoservice.com
 ### Fetch Data
 
 1. Click **"🔄 Refresh Data from SmartLead"** button
-2. Wait for data to load (shows progress bar)
-3. Success message appears when done
+2. Wait for data to load (shows page number, offset, `limit=100`, and fetched-account count)
+3. Success message appears only after every page is fetched; partial failed refreshes are not saved
 
 ### Search & Filter
 
@@ -260,6 +261,8 @@ APP_PASSWORD = "your_secure_password"
 - Verify bearer token is valid
 - Check internet connection
 - Ensure SmartLead API is accessible
+- If SmartLead returns rate-limit responses, the app honors `Retry-After` when provided and otherwise cools down before retrying
+- Retry the refresh after the API recovers; failed paginated fetches do not overwrite the previously loaded complete data
 
 ### Issue: Password not working
 
