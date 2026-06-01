@@ -6,6 +6,7 @@ A production-ready Streamlit application to view, search, filter, and export Sma
 
 - 🔐 **Password Protected**: Secure access with configurable password
 - 🔄 **Manual Refresh**: Fetch latest data on-demand from SmartLead API
+- 🚀 **Optimized Pagination**: Fetch all account pages with `limit=100`, adaptive pacing up to 800 requests/minute, bounded retries, and throttled UI updates
 - 🔍 **Interactive Search**: Real-time search across all columns
 - 🎯 **Smart Filtering**: Filter by account status (Active/Inactive)
 - 📊 **Rich Metrics**: Dashboard with key account statistics
@@ -191,8 +192,8 @@ sudo certbot --nginx -d smartlead-accounts.eagleinfoservice.com
 ### Fetch Data
 
 1. Click **"🔄 Refresh Data from SmartLead"** button
-2. Wait for data to load (shows progress bar)
-3. Success message appears when done
+2. Wait for data to load (status updates are intentionally throttled to avoid Streamlit session/websocket errors during fast pagination)
+3. Success message appears only after every page is fetched; partial failed refreshes are not saved
 
 ### Search & Filter
 
@@ -260,6 +261,9 @@ APP_PASSWORD = "your_secure_password"
 - Verify bearer token is valid
 - Check internet connection
 - Ensure SmartLead API is accessible
+- If SmartLead returns rate-limit responses, the app honors `Retry-After` when provided, caps any single retry sleep, automatically lowers the current request pace, and then ramps back up after sustained success
+- If SmartLead returns malformed JSON, a duplicate page, or too many pages, the app stops safely instead of hanging or saving partial data
+- Retry the refresh after the API recovers; failed paginated fetches do not overwrite the previously loaded complete data
 
 ### Issue: Password not working
 
@@ -271,9 +275,9 @@ APP_PASSWORD = "your_secure_password"
 ### Issue: Slow data loading
 
 **Solution**:
-- Large accounts lists (10,000+) may take 30-60 seconds
-- Progress bar shows loading status
-- Consider caching for frequent access
+- Large account lists are fetched with `limit=100` pages and adaptive pacing. The app can ramp up toward 800 requests/minute, but it starts safer and slows down automatically if SmartLead pushes back.
+- Progress/status updates show the current request pace and are intentionally throttled to avoid Streamlit session-message errors.
+- Consider refreshing during low-traffic periods if SmartLead repeatedly rate-limits the account endpoint.
 
 ## API Endpoints Used
 
