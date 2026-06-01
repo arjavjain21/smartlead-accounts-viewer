@@ -5,9 +5,10 @@ A production-ready Streamlit app to view, search, filter, and export SmartLead e
 
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
@@ -17,11 +18,20 @@ import pandas as pd
 ACCOUNTS_URL = "https://server.smartlead.ai/api/email-account/get-total-email-accounts"
 CLIENT_URL = "https://server.smartlead.ai/api/v1/client/"
 ACCOUNTS_PAGE_LIMIT = 100
-SMARTLEAD_REQUESTS_PER_MINUTE = 800
-MIN_ACCOUNT_REQUEST_INTERVAL_SECONDS = 60 / SMARTLEAD_REQUESTS_PER_MINUTE
+SMARTLEAD_MAX_REQUESTS_PER_MINUTE = 800
+SMARTLEAD_INITIAL_REQUESTS_PER_MINUTE = 120
+SMARTLEAD_MIN_REQUESTS_PER_MINUTE = 30
+RATE_LIMIT_BACKOFF_MULTIPLIER = 0.5
+RATE_LIMIT_RECOVERY_MULTIPLIER = 1.25
+SUCCESSFUL_PAGES_BEFORE_RATE_INCREASE = 5
+ACCOUNT_PROGRESS_UPDATE_SECONDS = 0.5
+ACCOUNT_PROGRESS_UPDATE_PAGES = 10
+MAX_ACCOUNT_PAGES_SAFETY = 10000
+REQUEST_TIMEOUT_SECONDS = (10, 60)
 MAX_RETRIES = 6
 RETRY_BACKOFF_SECONDS = 5
 RATE_LIMIT_COOLDOWN_SECONDS = 60
+MAX_RETRY_SLEEP_SECONDS = 300
 
 # Page config
 st.set_page_config(
@@ -96,7 +106,7 @@ def check_password() -> bool:
 
 
 class AccountFetchError(RuntimeError):
-    """Raised when a page cannot be fetched safely after retries."""
+    """Raised when account pagination cannot finish safely."""
 
 
 def get_retry_after_seconds(retry_after: Optional[str]) -> Optional[float]:
@@ -119,26 +129,139 @@ def get_retry_after_seconds(retry_after: Optional[str]) -> Optional[float]:
     return max((retry_at - datetime.now(retry_at.tzinfo)).total_seconds(), 0.0)
 
 
-def rate_limit_wait(last_request_at: Optional[float]) -> float:
-    """Wait just enough to keep account-page requests within the configured RPM."""
-    if last_request_at is None:
-        return time.monotonic()
+def capped_sleep_seconds(seconds: float) -> float:
+    """Keep retry sleeps bounded so one bad API response cannot hang the app indefinitely."""
+    return min(max(seconds, 0.0), MAX_RETRY_SLEEP_SECONDS)
 
-    elapsed = time.monotonic() - last_request_at
-    remaining = MIN_ACCOUNT_REQUEST_INTERVAL_SECONDS - elapsed
-    if remaining > 0:
-        time.sleep(remaining)
 
-    return time.monotonic()
+@dataclass
+class AccountRateLimiter:
+    """Adaptive account-request limiter with an 800 RPM ceiling and safe backoff."""
+
+    max_rpm: float = SMARTLEAD_MAX_REQUESTS_PER_MINUTE
+    current_rpm: float = SMARTLEAD_INITIAL_REQUESTS_PER_MINUTE
+    min_rpm: float = SMARTLEAD_MIN_REQUESTS_PER_MINUTE
+    last_request_at: Optional[float] = None
+    successful_pages_since_adjustment: int = 0
+
+    @property
+    def interval_seconds(self) -> float:
+        return 60 / max(self.current_rpm, 1)
+
+    def wait(self) -> None:
+        """Pace the next request according to the current adaptive RPM."""
+        if self.last_request_at is not None:
+            elapsed = time.monotonic() - self.last_request_at
+            remaining = self.interval_seconds - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+        self.last_request_at = time.monotonic()
+
+    def record_success(self) -> None:
+        """Gently ramp up after sustained successful pages, never above the 800 RPM ceiling."""
+        self.successful_pages_since_adjustment += 1
+        if self.successful_pages_since_adjustment < SUCCESSFUL_PAGES_BEFORE_RATE_INCREASE:
+            return
+
+        self.current_rpm = min(
+            self.max_rpm,
+            self.current_rpm * RATE_LIMIT_RECOVERY_MULTIPLIER,
+        )
+        self.successful_pages_since_adjustment = 0
+
+    def record_rate_limit(self) -> None:
+        """Immediately slow down when SmartLead signals rate limiting."""
+        self.current_rpm = max(
+            self.min_rpm,
+            self.current_rpm * RATE_LIMIT_BACKOFF_MULTIPLIER,
+        )
+        self.successful_pages_since_adjustment = 0
+
+
+def build_page_fingerprint(accounts: List[Dict[str, Any]]) -> Tuple[Any, ...]:
+    """Create a lightweight page fingerprint to detect repeated pages from a stuck API offset."""
+    if not accounts:
+        return (0,)
+
+    first = accounts[0]
+    last = accounts[-1]
+    first_key = (
+        first.get("id")
+        or first.get("email")
+        or first.get("from_email")
+        or json.dumps(first, sort_keys=True, default=str)
+    )
+    last_key = (
+        last.get("id")
+        or last.get("email")
+        or last.get("from_email")
+        or json.dumps(last, sort_keys=True, default=str)
+    )
+    return (len(accounts), first_key, last_key)
+
+
+class AccountFetchProgress:
+    """Throttled Streamlit progress updates to avoid websocket/session message floods."""
+
+    def __init__(self) -> None:
+        self.progress_bar = st.progress(0)
+        self.status_text = st.empty()
+        self.last_update_at = 0.0
+
+    def update(
+        self,
+        page_number: int,
+        offset: int,
+        total_accounts: int,
+        last_page_count: Optional[int] = None,
+        current_rpm: Optional[float] = None,
+        note: str = "",
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        should_update = (
+            force
+            or page_number == 1
+            or page_number % ACCOUNT_PROGRESS_UPDATE_PAGES == 0
+            or now - self.last_update_at >= ACCOUNT_PROGRESS_UPDATE_SECONDS
+        )
+        if not should_update:
+            return
+
+        page_detail = f", last page {last_page_count} rows" if last_page_count is not None else ""
+        rate_detail = f" Current pace: {current_rpm:.0f}/min" if current_rpm is not None else ""
+        note_detail = f" {note}" if note else ""
+        self.status_text.text(
+            f"Fetching SmartLead accounts: page {page_number}, offset {offset}, "
+            f"limit {ACCOUNTS_PAGE_LIMIT}, fetched {total_accounts} accounts{page_detail}."
+            f"{rate_detail} (max {SMARTLEAD_MAX_REQUESTS_PER_MINUTE}/min).{note_detail}"
+        )
+        self.progress_bar.progress(min(total_accounts / 10000, 1.0))
+        self.last_update_at = now
+
+    def close(self) -> None:
+        self.progress_bar.empty()
+        self.status_text.empty()
 
 
 def fetch_account_page(
     offset: int,
     limit: int,
     bearer_token: str,
-    max_retries: int = MAX_RETRIES
+    session: requests.Session,
+    rate_limiter: AccountRateLimiter,
+    progress: AccountFetchProgress,
+    page_number: int,
+    total_accounts: int,
+    max_retries: int = MAX_RETRIES,
 ) -> List[Dict[str, Any]]:
-    """Fetch a single account page with retries; raise instead of returning partial failure."""
+    """Fetch one account page with adaptive pacing and bounded retries."""
+    if limit != ACCOUNTS_PAGE_LIMIT:
+        raise ValueError(
+            f"SmartLead account fetches must use limit={ACCOUNTS_PAGE_LIMIT} to keep pagination stable."
+        )
+
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {bearer_token}",
@@ -146,39 +269,80 @@ def fetch_account_page(
 
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(
+            rate_limiter.wait()
+            resp = session.get(
                 ACCOUNTS_URL,
                 headers=headers,
                 params={"offset": offset, "limit": limit},
-                timeout=30,
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
             if resp.status_code == 429:
-                retry_delay = get_retry_after_seconds(resp.headers.get("Retry-After")) or RATE_LIMIT_COOLDOWN_SECONDS
-                st.warning(
-                    f"⚠️ Rate limit hit at offset {offset}. Cooling down for {retry_delay:.0f}s "
-                    f"(attempt {attempt}/{max_retries})."
+                if attempt == max_retries:
+                    raise AccountFetchError(
+                        f"SmartLead rate limited account fetch at offset {offset} after {max_retries} attempts."
+                    )
+
+                rate_limiter.record_rate_limit()
+                retry_delay = capped_sleep_seconds(
+                    get_retry_after_seconds(resp.headers.get("Retry-After")) or RATE_LIMIT_COOLDOWN_SECONDS
+                )
+                progress.update(
+                    page_number,
+                    offset,
+                    total_accounts,
+                    current_rpm=rate_limiter.current_rpm,
+                    note=(
+                        f"Rate limited; cooling down for {retry_delay:.0f}s "
+                        f"before retry {attempt + 1}/{max_retries}."
+                    ),
+                    force=True,
                 )
                 time.sleep(retry_delay)
                 continue
 
             resp.raise_for_status()
-            payload = resp.json()
+            try:
+                payload = resp.json()
+            except ValueError as e:
+                if attempt == max_retries:
+                    raise AccountFetchError(f"SmartLead returned invalid JSON at offset {offset}.") from e
+                time.sleep(capped_sleep_seconds(RETRY_BACKOFF_SECONDS * attempt))
+                continue
+
             if isinstance(payload, dict):
                 message = str(payload.get("message", "")).lower()
                 if "too many attempts" in message or "rate limit" in message:
-                    st.warning(
-                        f"⚠️ API reported rate limit at offset {offset}. Cooling down for {RATE_LIMIT_COOLDOWN_SECONDS}s "
-                        f"(attempt {attempt}/{max_retries})."
+                    if attempt == max_retries:
+                        raise AccountFetchError(
+                            f"SmartLead reported account-fetch rate limiting at offset {offset} "
+                            f"after {max_retries} attempts."
+                        )
+
+                    rate_limiter.record_rate_limit()
+                    retry_delay = capped_sleep_seconds(RATE_LIMIT_COOLDOWN_SECONDS)
+                    progress.update(
+                        page_number,
+                        offset,
+                        total_accounts,
+                        current_rpm=rate_limiter.current_rpm,
+                        note=(
+                            f"API asked us to slow down; cooling down for {retry_delay:.0f}s "
+                            f"before retry {attempt + 1}/{max_retries}."
+                        ),
+                        force=True,
                     )
-                    time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+                    time.sleep(retry_delay)
                     continue
 
             data = payload.get("data") if isinstance(payload, dict) else None
             accounts = data.get("email_accounts") if isinstance(data, dict) else None
             if not isinstance(accounts, list):
-                raise AccountFetchError(f"Unexpected account response format at offset {offset}.")
+                raise AccountFetchError(
+                    f"Unexpected SmartLead account response format at offset {offset}."
+                )
 
+            rate_limiter.record_success()
             return accounts
         except requests.RequestException as e:
             if attempt == max_retries:
@@ -186,51 +350,114 @@ def fetch_account_page(
                     f"Failed to fetch accounts at offset {offset} after {max_retries} attempts: {str(e)}"
                 ) from e
 
-            retry_delay = RETRY_BACKOFF_SECONDS * attempt
-            st.warning(
-                f"⚠️ Request failed at offset {offset}. Retrying in {retry_delay}s "
-                f"(attempt {attempt}/{max_retries}). Error: {str(e)}"
+            retry_delay = capped_sleep_seconds(RETRY_BACKOFF_SECONDS * attempt)
+            progress.update(
+                page_number,
+                offset,
+                total_accounts,
+                current_rpm=rate_limiter.current_rpm,
+                note=f"Request failed; retrying in {retry_delay:.0f}s ({attempt + 1}/{max_retries}).",
+                force=True,
             )
             time.sleep(retry_delay)
 
-    raise AccountFetchError(f"Failed to fetch accounts at offset {offset} due to repeated rate limiting.")
-
+    raise AccountFetchError(
+        f"Failed to fetch accounts at offset {offset} due to repeated rate limiting."
+    )
 
 def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_PAGE_LIMIT) -> List[Dict[str, Any]]:
     """Retrieve every email account page using limit=100 and an 800 RPM throttle."""
     if limit != ACCOUNTS_PAGE_LIMIT:
         raise ValueError(f"SmartLead account fetches must use limit={ACCOUNTS_PAGE_LIMIT} to keep pagination stable.")
 
+def fetch_accounts_paginated(
+    bearer_token: str,
+    limit: int = ACCOUNTS_PAGE_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Retrieve every email account page using limit=100 and adaptive pacing up to 800 RPM."""
+    if limit != ACCOUNTS_PAGE_LIMIT:
+        raise ValueError(
+            f"SmartLead account fetches must use limit={ACCOUNTS_PAGE_LIMIT} to keep pagination stable."
+        )
+
     all_accounts: List[Dict[str, Any]] = []
+    seen_page_fingerprints = set()
     offset = 0
     page_number = 1
-    last_request_at: Optional[float] = None
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    rate_limiter = AccountRateLimiter()
+    progress = AccountFetchProgress()
 
-    while True:
-        status_text.text(
-            f"Fetching SmartLead accounts page {page_number} "
-            f"(offset {offset}, limit {ACCOUNTS_PAGE_LIMIT}, cap {SMARTLEAD_REQUESTS_PER_MINUTE} requests/min)..."
+    try:
+        progress.update(
+            page_number,
+            offset,
+            len(all_accounts),
+            current_rpm=rate_limiter.current_rpm,
+            force=True,
         )
-        last_request_at = rate_limit_wait(last_request_at)
-        page = fetch_account_page(offset, ACCOUNTS_PAGE_LIMIT, bearer_token)
+        with requests.Session() as session:
+            while True:
+                if page_number > MAX_ACCOUNT_PAGES_SAFETY:
+                    raise AccountFetchError(
+                        f"Stopped after {MAX_ACCOUNT_PAGES_SAFETY} pages to avoid an endless fetch loop. "
+                        "Please verify SmartLead pagination is advancing correctly."
+                    )
 
-        if not page:
-            break
+                page = fetch_account_page(
+                    offset,
+                    ACCOUNTS_PAGE_LIMIT,
+                    bearer_token,
+                    session,
+                    rate_limiter,
+                    progress,
+                    page_number,
+                    len(all_accounts),
+                )
 
-        all_accounts.extend(page)
-        progress_bar.progress(min(len(all_accounts) / 10000, 1.0))
-        status_text.text(f"Fetched {len(all_accounts)} accounts so far; last page returned {len(page)} rows.")
+                if not page:
+                    progress.update(
+                        page_number,
+                        offset,
+                        len(all_accounts),
+                        0,
+                        current_rpm=rate_limiter.current_rpm,
+                        force=True,
+                    )
+                    break
 
-        if len(page) < ACCOUNTS_PAGE_LIMIT:
-            break
+                page_fingerprint = build_page_fingerprint(page)
+                if page_fingerprint in seen_page_fingerprints:
+                    raise AccountFetchError(
+                        f"SmartLead returned a duplicate account page at offset {offset}; "
+                        "stopping to avoid saving incomplete or repeated data."
+                    )
+                seen_page_fingerprints.add(page_fingerprint)
 
-        offset += ACCOUNTS_PAGE_LIMIT
-        page_number += 1
+                all_accounts.extend(page)
+                progress.update(
+                    page_number,
+                    offset,
+                    len(all_accounts),
+                    len(page),
+                    current_rpm=rate_limiter.current_rpm,
+                )
 
-    progress_bar.empty()
-    status_text.empty()
+                if len(page) < ACCOUNTS_PAGE_LIMIT:
+                    progress.update(
+                        page_number,
+                        offset,
+                        len(all_accounts),
+                        len(page),
+                        current_rpm=rate_limiter.current_rpm,
+                        force=True,
+                    )
+                    break
+
+                offset += ACCOUNTS_PAGE_LIMIT
+                page_number += 1
+    finally:
+        progress.close()
+
     return all_accounts
 
 def fetch_clients(api_key: str) -> Dict[int, Dict[str, Any]]:
