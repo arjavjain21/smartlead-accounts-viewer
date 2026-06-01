@@ -365,6 +365,10 @@ def fetch_account_page(
         f"Failed to fetch accounts at offset {offset} due to repeated rate limiting."
     )
 
+def fetch_accounts_paginated(bearer_token: str, limit: int = ACCOUNTS_PAGE_LIMIT) -> List[Dict[str, Any]]:
+    """Retrieve every email account page using limit=100 and an 800 RPM throttle."""
+    if limit != ACCOUNTS_PAGE_LIMIT:
+        raise ValueError(f"SmartLead account fetches must use limit={ACCOUNTS_PAGE_LIMIT} to keep pagination stable.")
 
 def fetch_accounts_paginated(
     bearer_token: str,
@@ -455,7 +459,6 @@ def fetch_accounts_paginated(
         progress.close()
 
     return all_accounts
-
 
 def fetch_clients(api_key: str) -> Dict[int, Dict[str, Any]]:
     """Retrieve clients and return a dict keyed by id."""
